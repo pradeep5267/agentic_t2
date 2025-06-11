@@ -1,0 +1,8 @@
+- download geofabrik map for england
+- download/export kml of the polygons in a single kml file
+- run kml_to_poly file to create the .poly file
+  - Usage: python kml_to_poly.py <input_kml_file> <output_poly_file>
+- osmium extract   --polygon combine_poly.poly   england-latest.osm.pbf   -o t2_a1_a2.osm.pbf
+- osmium cat t2_a1_a2.osm.pbf -o combined_area.osm
+- run aio_map_parser_t14_mk2.py to create the roads only geojson file
+  - and also to create the folium map (for visualization and debugging) 

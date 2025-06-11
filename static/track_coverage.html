@@ -1,0 +1,423 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Track Coverage with Manual Mark & Recorder State</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+
+  <link rel="stylesheet" href="/static/leaflet.css" />
+
+  <style>
+    html, body { height:100%; margin:0; padding:0; font-family:Arial,sans-serif; }
+    #container { display:flex; height:100%; }
+    #sidebar {
+      width:280px; overflow-y:auto; background:#f0f0f0;
+      border-right:1px solid #ccc; padding:12px; box-sizing:border-box;
+    }
+    #map { flex:1; }
+    h2 { margin-top:0; }
+    .filter-group { margin-bottom:18px; }
+    .filter-group fieldset { border:1px solid #bbb; padding:8px; background:#fff; }
+    .filter-group legend { font-weight:bold; }
+    .filter-group label { display:block; margin-bottom:4px; }
+    #reset-filters {
+      margin-top:10px; padding:6px 12px; background:#007bff;
+      color:#fff; border:none; border-radius:3px; cursor:pointer;
+    }
+    #reset-filters:hover { background:#0056b3; }
+    .export-section { margin-top:20px; padding-top:20px; border-top:1px solid #ccc; }
+    .export-btn {
+      display:inline-block; margin:5px 5px 5px 0;
+      padding:6px 12px; background:#28a745; color:#fff;
+      text-decoration:none; border-radius:3px; font-size:14px;
+    }
+    .export-btn:hover { background:#218838; }
+    .stats-section {
+      margin-top:20px; padding:10px; background:#f8f9fa;
+      border-radius:4px; font-size:14px;
+    }
+    .stats-section h3 { margin-top:0; font-size:16px; }
+    #status-box, #recorder-box {
+      position:absolute; right:10px; background:rgba(255,255,255,0.95);
+      padding:6px 10px; border-radius:4px; box-shadow:0 0 5px rgba(0,0,0,0.25);
+      z-index:1000; font-size:14px;
+    }
+    #status-box { top:10px; }
+    #recorder-box { top:80px; }
+    .recordings-section {
+      margin-top:20px; padding:10px; background:#f8f9fa;
+      border-radius:4px; font-size:14px;
+    }
+    .recordings-section h3 { margin-top:0; font-size:16px; }
+  </style>
+</head>
+<body>
+  <div id="container">
+    <div id="sidebar">
+      <h2>Filters</h2>
+      <div class="filter-group" id="polygon-filter"><fieldset><legend>Polygon Areas</legend></fieldset></div>
+      <div class="filter-group" id="status-filter"><fieldset><legend>Status</legend></fieldset></div>
+      <div class="filter-group" id="highway-filter"><fieldset><legend>Highway Type</legend></fieldset></div>
+      <button id="reset-filters">Reset Filters</button>
+
+      <div class="export-section">
+        <h3>Export Covered Roads</h3>
+        <a href="#" class="export-btn" onclick="exportCoveredRoads('json');return false;">Export JSON</a>
+        <a href="#" class="export-btn" onclick="exportCoveredRoads('csv');return false;">Export CSV</a>
+        <a href="#" class="export-btn" onclick="exportCoveredRoads('geojson');return false;">Export GeoJSON</a>
+      </div>
+
+      <div class="stats-section" id="stats-section">
+        <h3>Coverage Statistics</h3>
+        <div id="stats-content">Loading...</div>
+      </div>
+      
+      <div class="recordings-section" id="recordings-section">
+        <h3>Recent Recordings</h3>
+        <div id="recordings-content">Loading...</div>
+      </div>
+    </div>
+
+    <div id="map"></div>
+    <div id="status-box">Initializing...</div>
+    <div id="recorder-box">
+      <strong>Recorder</strong><br>
+      Lat: –<br>
+      Lon: –<br>
+      Heading: –°<br>
+      Orientation: –<br>
+      Updated: –
+    </div>
+  </div>
+
+  <script src="/static/leaflet.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@turf/turf@6.5.0/turf.min.js"></script>
+
+  <script>
+    // Config
+    const GEOJSON_PATH = "/static/roads_with_polygons.geojson";
+    const API_COVERED  = "/api/covered";
+    const API_MANUAL   = "/api/manual-mark";
+    const API_MANUAL_LIST = "/api/manual-marks";
+    const API_RECORDER = "/api/recorder-state";
+    const API_STATS    = "/api/stats";
+    const COVER_THRESHOLD = 10; // meters
+
+    // State
+    window.map = null;
+    window.allRoads = null;
+    window.roadsLayer = null;
+    window.coveredFeatureIds = new Set();
+    window.manualMarks = {};     // { feature_id: 'complete' }
+    window.userMarker = null;
+    window.recorderMarker = null;
+
+    // Unique & active filters
+    const uniquePolygons = new Set(), uniqueStatuses = new Set(), uniqueHighways = new Set();
+    const activePolygons = new Set(), activeStatuses = new Set(), activeHighways = new Set();
+
+    // DOM refs
+    const polyFS = document.querySelector("#polygon-filter fieldset");
+    const statFS = document.querySelector("#status-filter fieldset");
+    const hwyFS  = document.querySelector("#highway-filter fieldset");
+    const statusBox = document.getElementById("status-box");
+    const recBox    = document.getElementById("recorder-box");
+    const resetBtn  = document.getElementById("reset-filters");
+
+    // 1) Load covered + manual marks
+    async function loadCoveredAndManual(){
+      // covered
+      let resp = await fetch(API_COVERED);
+      if(resp.ok){
+        let data = await resp.json();
+        data.covered.forEach(id=>window.coveredFeatureIds.add(id));
+      }
+      // manual
+      resp = await fetch(API_MANUAL_LIST);
+      if(resp.ok){
+        window.manualMarks = await resp.json();
+      }
+    }
+
+    // 2) Load GeoJSON + build filters
+    async function loadGeoJSONAndUI(){
+      try {
+        const resp = await fetch(GEOJSON_PATH);
+        if (!resp.ok) {
+          console.error(`Failed to load GeoJSON: ${resp.status} ${resp.statusText}`);
+          return;
+        }
+        const data = await resp.json();
+        window.allRoads = data;
+        data.features.forEach(f=>{
+          const p=f.properties.polygon||"NoPolygon",
+                s=f.properties.status||"allowed",
+                h=f.properties.highway||"unknown";
+          uniquePolygons.add(p);
+          uniqueStatuses.add(s);
+          uniqueHighways.add(h);
+        });
+        // init actives
+        uniquePolygons.forEach(p=>activePolygons.add(p));
+        uniqueStatuses.forEach(s=>activeStatuses.add(s));
+        uniqueHighways.forEach(h=>activeHighways.add(h));
+        buildFilterUI();
+      } catch (error) {
+        console.error("Error loading GeoJSON:", error);
+        statusBox.textContent = "Error loading road data. Please check console.";
+      }
+    }
+
+    function buildFilterUI(){
+      function makeCB(id, txt, fs, onchg){
+        const wrapper = document.createElement("div");
+        const cb = document.createElement("input");
+        cb.type="checkbox"; cb.id=id; cb.checked=true;
+        const lbl=document.createElement("label");
+        lbl.htmlFor=id; lbl.style.marginLeft="6px"; lbl.textContent=txt;
+        wrapper.append(cb,lbl); fs.append(wrapper);
+        cb.addEventListener("change", onchg);
+      }
+      uniquePolygons.forEach(p=>{
+        makeCB(`fp__${p}`,p,polyFS,e=>{
+          e.target.checked?activePolygons.add(p):activePolygons.delete(p);
+          applyFilters(); updateStatusBox();
+        });
+      });
+      uniqueStatuses.forEach(s=>{
+        makeCB(`fs__${s}`,s,statFS,e=>{
+          e.target.checked?activeStatuses.add(s):activeStatuses.delete(s);
+          applyFilters(); updateStatusBox();
+        });
+      });
+      uniqueHighways.forEach(h=>{
+        makeCB(`fh__${h}`,h,hwyFS,e=>{
+          e.target.checked?activeHighways.add(h):activeHighways.delete(h);
+          applyFilters(); updateStatusBox();
+        });
+      });
+      resetBtn.addEventListener("click",()=>{
+        activePolygons.clear(); uniquePolygons.forEach(p=>activePolygons.add(p));
+        activeStatuses.clear(); uniqueStatuses.forEach(s=>activeStatuses.add(s));
+        activeHighways.clear(); uniqueHighways.forEach(h=>activeHighways.add(h));
+        document.querySelectorAll("input[type=checkbox]").forEach(cb=>cb.checked=true);
+        applyFilters(); updateStatusBox();
+      });
+    }
+
+    // 3) Init map
+    function initializeMap(){
+      window.map = L.map("map");
+      L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png",
+        { attribution:"&copy; OpenStreetMap contributors" }
+      ).addTo(window.map);
+      window.roadsLayer = L.layerGroup().addTo(window.map);
+    }
+
+    // 4) Draw roads with combined auto/manual styling
+    function applyFilters(){
+      window.roadsLayer.clearLayers();
+      window.allRoads.features.forEach(f=>{
+        const p=f.properties.polygon||"NoPolygon", s=f.properties.status||"allowed", h=f.properties.highway||"unknown";
+        if(!activePolygons.has(p)||!activeStatuses.has(s)||!activeHighways.has(h)) return;
+        const fid=f.properties.id;
+        // Convert coordinates from [lon, lat] to [lat, lon] for Leaflet
+        const coords = f.geometry.type === "LineString" 
+          ? f.geometry.coordinates.map(c=>[c[1],c[0]])
+          : f.geometry.coordinates[0].map(c=>[c[1],c[0]]);
+        
+        // decide color
+        let color="blue";
+        if(window.manualMarks[fid]==="complete") color="green";
+        else if(window.coveredFeatureIds.has(fid)) color="darkgreen";
+        const line=L.polyline(coords,{color,weight:2,opacity:0.8});
+        line.featureId=fid;
+        line.on("click",onRoadClick);
+        window.roadsLayer.addLayer(line);
+      });
+      // fit bounds
+      const pls=window.roadsLayer.getLayers().filter(l=>l instanceof L.Polyline);
+      if(pls.length){
+        const fg=L.featureGroup(pls);
+        window.map.fitBounds(fg.getBounds().pad(0.1));
+      }
+    }
+
+    // 5) Status box
+    function updateStatusBox(){
+      let total=0, covered=0;
+      window.allRoads.features.forEach(f=>{
+        if(f.properties.status!=="allowed") return;
+        const p=f.properties.polygon||"NoPolygon", s=f.properties.status||"allowed";
+        if(!activePolygons.has(p)||!activeStatuses.has(s)||!activeHighways.has(f.properties.highway)) return;
+        total++;
+        if(window.coveredFeatureIds.has(f.properties.id)) covered++;
+      });
+      statusBox.textContent=`Covered: ${covered} / ${total} — Remaining: ${total-covered}`;
+    }
+
+    // 6) Auto-coverage via geolocation
+    window.onPositionUpdate=async function(pos){
+      const lat=pos.coords.latitude, lon=pos.coords.longitude, acc=pos.coords.accuracy;
+      if(!window.userMarker){
+        window.userMarker=L.circleMarker([lat,lon],{radius:6,color:"blue",fill:"#3388ff",fillOpacity:0.8}).addTo(map);
+        window.map.panTo([lat,lon]);
+      } else window.userMarker.setLatLng([lat,lon]);
+
+      const pt=turf.point([lon,lat]);
+      window.roadsLayer.eachLayer(async layer=>{
+        if(!(layer instanceof L.Polyline)) return;
+        const fid=layer.featureId;
+        if(window.coveredFeatureIds.has(fid)) return;
+        const line=turf.lineString(layer.getLatLngs().map(ll=>[ll.lng,ll.lat]));
+        const d=turf.pointToLineDistance(pt,line,{units:"meters"});
+        if(d<=COVER_THRESHOLD){
+          window.coveredFeatureIds.add(fid);
+          if(!window.manualMarks[fid]){
+            layer.setStyle({color:"darkgreen",opacity:0.9});
+          }
+          await fetch(API_COVERED,{
+            method:"POST",
+            headers:{"Content-Type":"application/json"},
+            body:JSON.stringify({id:fid,lat,lon,accuracy:acc})
+          });
+          updateStatusBox(); updateStats();
+        }
+      });
+    };
+
+    function onPositionError(e){ console.warn("Geo error",e); }
+    function setupGeo(){ navigator.geolocation.watchPosition(window.onPositionUpdate,onPositionError,{enableHighAccuracy:true,maximumAge:1000,timeout:10000}); }
+
+    // 7) Manual click toggles
+    async function onRoadClick(e){
+      const fid = this.featureId;
+      const newStatus = window.manualMarks[fid]==="complete"? "incomplete" : "complete";
+      try {
+        await fetch(API_MANUAL,{
+          method:"POST",
+          headers:{"Content-Type":"application/json"},
+          body:JSON.stringify({feature_id:fid,status:newStatus})
+        });
+        if(newStatus==="complete"){
+          window.manualMarks[fid]="complete";
+          this.setStyle({color:"green",opacity:0.9});
+        } else {
+          delete window.manualMarks[fid];
+          // fallback to auto state
+          const auto = window.coveredFeatureIds.has(fid)?"darkgreen":"blue";
+          this.setStyle({color:auto,opacity:0.8});
+        }
+      } catch(err){
+        console.error("Manual mark failed",err);
+      }
+    }
+
+    // 8) Recorder state widget
+    async function updateRecorderState(){
+      try {
+        const res = await fetch(API_RECORDER);
+        if(!res.ok) return;
+        const s=await res.json();
+        if(!s.lat) return;
+        recBox.innerHTML = `
+          <strong>Recorder</strong><br>
+          Lat: ${s.lat.toFixed(6)}<br>
+          Lon: ${s.lon.toFixed(6)}<br>
+          Heading: ${s.heading.toFixed(1)}°<br>
+          Orientation: ${s.orientation}<br>
+          Updated: ${new Date(s.ts).toLocaleTimeString()}
+        `;
+        
+        // Update or create recorder marker
+        if (!window.recorderMarker) {
+          window.recorderMarker = L.circleMarker([s.lat, s.lon], {
+            radius: 8,
+            color: "red",
+            fill: true,
+            fillColor: "#ff3333",
+            fillOpacity: 0.8,
+            weight: 2
+          }).addTo(map);
+        } else {
+          window.recorderMarker.setLatLng([s.lat, s.lon]);
+        }
+      } catch(e){
+        console.warn("Recorder state fetch error",e);
+      }
+    }
+
+    // 9) Stats & export
+    async function updateStats(){
+      try {
+        const r=await fetch(API_STATS);
+        if (!r.ok) {
+          console.error(`Stats API error: ${r.status} ${r.statusText}`);
+          return;
+        }
+        
+        const s=await r.json();
+        let html=`<div><strong>Total Covered Roads:</strong> ${s.total_covered}</div>`;
+        const today = s.daily_coverage.find(d=>d.date===new Date().toISOString().split("T")[0]);
+        if(today) html+=`<div><strong>Today's:</strong> ${today.roads_covered} roads (${today.total_passes} passes)</div>`;
+        if(s.most_covered_roads.length){
+          html+='<div style="margin-top:10px;"><strong>Top Roads:</strong></div><ul style="font-size:12px;margin:5px 0;padding-left:20px;">';
+          s.most_covered_roads.slice(0,5).forEach(r=> html+=`<li>${r.feature_id} (${r.coverage_count} passes)</li>`);
+          html+='</ul>';
+        }
+        document.getElementById("stats-content").innerHTML=html;
+        
+        // Update recordings section
+        let recHtml = '';
+        if (s.recent_recordings && s.recent_recordings.length) {
+          recHtml = '<ul style="font-size:12px;margin:5px 0;padding-left:20px;">';
+          s.recent_recordings.forEach(rec => {
+            const date = new Date(rec.started_at).toLocaleString();
+            recHtml += `<li>${rec.feature_id}<br>
+                        <small>${date}<br>
+                        Coverage: ${rec.coverage_percent.toFixed(1)}%</small></li>`;
+          });
+          recHtml += '</ul>';
+        } else {
+          recHtml = '<div>No recent recordings</div>';
+        }
+        document.getElementById("recordings-content").innerHTML = recHtml;
+      } catch(e){ 
+        console.error("Stats error",e); 
+        document.getElementById("stats-content").innerHTML = "Error loading stats";
+        document.getElementById("recordings-content").innerHTML = "Error loading recordings";
+      }
+    }
+
+    function exportCoveredRoads(fmt){
+      const url=`/api/export/${fmt}`;
+      const ts=new Date().toISOString().replace(/[:.]/g,"-").slice(0,-5);
+      const a=document.createElement("a");
+      a.href=url; a.download=`covered_roads_${ts}.${fmt}`;
+      document.body.appendChild(a); a.click(); document.body.removeChild(a);
+    }
+
+    // Init
+    document.addEventListener("DOMContentLoaded", async ()=>{
+      statusBox.textContent = "Loading data...";
+      
+      try {
+        initializeMap();
+        await loadCoveredAndManual();
+        await loadGeoJSONAndUI();
+        applyFilters();
+        setupGeo();
+        updateStatusBox();
+        updateStats();
+        updateRecorderState();
+        setInterval(updateStats, 30000);
+        // --- FIX: Changed polling interval from 1 second to 10 seconds ---
+        setInterval(updateRecorderState, 10000);
+      } catch (error) {
+        console.error("Initialization error:", error);
+        statusBox.textContent = "Error initializing. Check console.";
+      }
+    });
+  </script>
+</body>
+</html>
