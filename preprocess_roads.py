@@ -18,7 +18,7 @@ import os
 BUFFER_WIDTH_METERS = 10  # Narrow buffer as requested
 SEGMENT_LENGTH_METERS = 10  # 10m segments
 SAVE_DIR = "/media/gamedisk/KTP_artefacts/pssavmk2_t2/preprocessed_roads"
-OUTPUT_DIR = f"{SAVE_DIR}/"
+OUTPUT_DIR = f"{SAVE_DIR}"
 INPUT_GEOJSON = f"{SAVE_DIR}/roads_with_polygons.geojson"
 
 # Create output directory

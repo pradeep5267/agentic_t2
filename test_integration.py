@@ -239,6 +239,30 @@ def create_test_roads():
     
     return road_data, bounds_array, buffer_polygons, road_ids
 
+# Load actual road data from existing files
+def load_actual_road_data():
+    """Load actual road data from existing preprocessed files"""
+    
+    try:
+        # Load actual preprocessed road data
+        bounds_array = np.load("preprocessed_roads/road_bounds.npy")
+        
+        with open("preprocessed_roads/road_data.pkl", "rb") as f:
+            road_data = pickle.load(f)
+        
+        with open("preprocessed_roads/buffer_polygons.pkl", "rb") as f:
+            buffer_polygons = pickle.load(f)
+        
+        with open("preprocessed_roads/road_ids.pkl", "rb") as f:
+            road_ids = pickle.load(f)
+        
+        print(f"Loaded {len(road_data)} actual roads for testing")
+        return road_data, bounds_array, buffer_polygons, road_ids
+        
+    except Exception as e:
+        print(f"Warning: Could not load actual road data: {e}")
+        return None, None, None, None
+
 # Create test directory structure and files with realistic data
 def setup_integration_test_environment():
     """Set up test environment with realistic road data files"""
@@ -609,6 +633,257 @@ class TestIntegration(unittest.TestCase):
         self.assertEqual(row[0], "789")
         
         conn.close()
+
+
+class TestIntegrationWithActualData(unittest.TestCase):
+    """Integration tests using actual road data from preprocessed files"""
+    
+    @classmethod
+    def setUpClass(cls):
+        """Set up test environment once for all tests"""
+        # Try to load actual road data
+        actual_data = load_actual_road_data()
+        if actual_data[0] is None:
+            raise unittest.SkipTest("Actual road data not available, skipping actual data tests")
+        
+        cls.road_data, cls.bounds_array, cls.buffer_polygons, cls.road_ids = actual_data
+        
+        # Prepare patches
+        cls.patches = [
+            patch('subprocess.Popen', MockPopen),
+            patch('subprocess.run', return_value=MagicMock(stdout="")),
+            patch('os.getpgid', return_value=12345),
+            patch('os.killpg', return_value=None),
+            patch('os.setsid', return_value=None),
+            patch('time.sleep', return_value=None),
+        ]
+        
+        # Start all patches
+        for p in cls.patches:
+            p.start()
+    
+    @classmethod
+    def tearDownClass(cls):
+        """Clean up test environment after all tests"""
+        # Stop all patches
+        for p in cls.patches:
+            p.stop()
+    
+    def setUp(self):
+        """Set up for each test"""
+        # Use a temporary database and CSV file
+        self.db_fd, self.db_path = tempfile.mkstemp()
+        self.csv_path = "/tmp/road_coverage_recordings/test_actual_data_log.csv"
+        if os.path.exists(self.csv_path):
+            os.remove(self.csv_path)
+        
+        # Patch paths and config
+        self.patches = [
+            patch('aio_t14b_mk2.DATABASE', self.db_path),
+            patch('aio_t14b_mk2.SAVE_DIR', '/tmp/road_coverage_recordings'),
+            patch('aio_t14b_mk2.CSV_FILE', self.csv_path),
+            patch('aio_t14b_mk2.SEGMENT_THRESHOLD_M', 50),
+            patch('aio_t14b_mk2.ROAD_EXIT_THRESHOLD_S', 1)
+        ]
+        
+        for p in self.patches:
+            p.start()
+        
+        # Import the module after patching
+        import aio_t14b_mk2
+        self.recorder = aio_t14b_mk2
+        
+        # Initialize test components
+        self.recorder.init_database()
+        self.recorder.init_csv()
+        
+        # Reset global state
+        self.recorder.gps_queue = queue.Queue()
+        self.recorder.gps_data = {}
+        self.recorder.road_coverage_state = {}
+        self.recorder.current_road_id = None
+        self.recorder.recording_proc = None
+        self.recorder.recording_file = None
+        self.recorder.recording_start_time = None
+        self.recorder.last_recording_stop = 0
+        self.recorder.shutdown_event = threading.Event()
+    
+    def tearDown(self):
+        """Clean up after each test"""
+        # Close database
+        os.close(self.db_fd)
+        os.unlink(self.db_path)
+        
+        # Remove CSV file
+        if os.path.exists(self.csv_path):
+            os.remove(self.csv_path)
+        
+        # Stop patches
+        for p in self.patches:
+            p.stop()
+    
+    def test_actual_road_detection(self):
+        """Test road detection with actual road data"""
+        # Select a few actual roads for testing
+        test_roads = self.road_ids[:5]  # Use first 5 roads
+        
+        for road_id in test_roads:
+            road_info = self.road_data[road_id]
+            if not road_info['segments']:
+                continue
+            
+            # Test with a point from the road's segments
+            lon, lat = road_info['segments'][0]
+            
+            # Mock recording functions
+            mock_start_recording = MagicMock(return_value="/tmp/test_recording.mp4")
+            mock_stop_recording = MagicMock()
+            
+            with patch('aio_t14b_mk2.start_recording', mock_start_recording):
+                with patch('aio_t14b_mk2.stop_recording', mock_stop_recording):
+                    with patch('aio_t14b_mk2.post_state'):
+                        # Create GPS data point
+                        gps_data = {
+                            'lat': lat,
+                            'lon': lon,
+                            'fix': True,
+                            'gps_qual': 1,
+                            'time': time.time()
+                        }
+                        
+                        self.recorder.gps_queue.put(gps_data)
+                        
+                        # Process the GPS point
+                        try:
+                            gps = self.recorder.gps_queue.get(timeout=0.1)
+                            rid, info = self.recorder.find_current_road(gps['lon'], gps['lat'])
+                            
+                            if rid:
+                                seg_idx, seg_dist = self.recorder.find_nearest_segment(rid, gps['lat'], gps['lon'])
+                                if seg_dist <= self.recorder.SEGMENT_THRESHOLD_M:
+                                    self.recorder.road_coverage_state.setdefault(rid, set()).add(seg_idx)
+                                
+                                # Handle road entry
+                                if rid != self.recorder.current_road_id:
+                                    with patch('aio_t14b_mk2.log_csv'):
+                                        if rid not in self.recorder.recorded_roads:
+                                            self.recorder.start_recording(rid)
+                                    
+                                    self.recorder.current_road_id = rid
+                                    self.recorder.last_on_road = time.time()
+                                    self.recorder.exit_logged = False
+                            
+                        except queue.Empty:
+                            pass
+            
+            # If we detected a road, verify it makes sense
+            if self.recorder.road_coverage_state:
+                detected_roads = list(self.recorder.road_coverage_state.keys())
+                print(f"Detected roads for {road_id}: {detected_roads}")
+                
+                # At least one road should be detected
+                self.assertGreater(len(detected_roads), 0, "Should detect at least one road")
+                
+                # Calculate coverage for detected roads
+                for detected_road in detected_roads:
+                    coverage = self.recorder.calculate_coverage(detected_road)
+                    self.assertGreaterEqual(coverage, 0, f"Coverage should be non-negative for {detected_road}")
+                    print(f"Coverage for {detected_road}: {coverage:.1f}%")
+            
+            # Reset for next test
+            self.recorder.road_coverage_state = {}
+            self.recorder.current_road_id = None
+    
+    def test_actual_road_segments_coverage(self):
+        """Test segment coverage calculation with actual roads"""
+        # Pick a road with multiple segments
+        test_road = None
+        for road_id in self.road_ids:
+            if len(self.road_data[road_id]['segments']) >= 3:
+                test_road = road_id
+                break
+        
+        if not test_road:
+            self.skipTest("No road with multiple segments found")
+        
+        road_info = self.road_data[test_road]
+        segments = road_info['segments']
+        
+        # Simulate GPS points along the road
+        mock_start_recording = MagicMock(return_value="/tmp/test_recording.mp4")
+        mock_stop_recording = MagicMock()
+        
+        with patch('aio_t14b_mk2.start_recording', mock_start_recording):
+            with patch('aio_t14b_mk2.stop_recording', mock_stop_recording):
+                with patch('aio_t14b_mk2.post_state'):
+                    with patch('aio_t14b_mk2.log_csv'):
+                        
+                        for i, (lon, lat) in enumerate(segments):
+                            gps_data = {
+                                'lat': lat,
+                                'lon': lon,
+                                'fix': True,
+                                'gps_qual': 1,
+                                'time': time.time() + i
+                            }
+                            
+                            self.recorder.gps_queue.put(gps_data)
+                            
+                            # Process the GPS point
+                            try:
+                                gps = self.recorder.gps_queue.get(timeout=0.1)
+                                rid, info = self.recorder.find_current_road(gps['lon'], gps['lat'])
+                                
+                                if rid:
+                                    seg_idx, seg_dist = self.recorder.find_nearest_segment(rid, gps['lat'], gps['lon'])
+                                    if seg_dist <= self.recorder.SEGMENT_THRESHOLD_M:
+                                        self.recorder.road_coverage_state.setdefault(rid, set()).add(seg_idx)
+                                
+                            except queue.Empty:
+                                pass
+        
+        # Verify coverage
+        if test_road in self.recorder.road_coverage_state:
+            coverage = self.recorder.calculate_coverage(test_road)
+            covered_segments = len(self.recorder.road_coverage_state[test_road])
+            total_segments = len(segments)
+            
+            print(f"Road {test_road}: {covered_segments}/{total_segments} segments covered = {coverage:.1f}%")
+            
+            # Should have covered some segments
+            self.assertGreater(covered_segments, 0, "Should cover at least one segment")
+            self.assertGreater(coverage, 0, "Coverage percentage should be greater than 0")
+            
+            # Coverage should not exceed 100%
+            self.assertLessEqual(coverage, 100, "Coverage should not exceed 100%")
+    
+    def test_actual_road_database_operations(self):
+        """Test database operations with actual road IDs"""
+        # Use actual road IDs for database operations
+        test_roads = self.road_ids[:3]  # Use first 3 roads
+        
+        conn = sqlite3.connect(self.db_path)
+        
+        # Add recordings for actual roads
+        for i, road_id in enumerate(test_roads):
+            conn.execute("""
+                INSERT INTO road_recordings 
+                (feature_id, video_file, started_at, coverage_percent)
+                VALUES (?, ?, ?, ?)
+            """, (road_id, f"/tmp/test_road_{road_id}.mp4", datetime.now().isoformat(), 75.5 + i))
+        
+        conn.commit()
+        conn.close()
+        
+        # Load recorded roads
+        recorded_roads = self.recorder.load_recorded_roads()
+        
+        # Verify all test roads were loaded
+        for road_id in test_roads:
+            self.assertIn(road_id, recorded_roads, f"Road {road_id} should be in recorded roads")
+        
+        print(f"Successfully loaded {len(recorded_roads)} recorded roads including actual road IDs")
+
 
 if __name__ == "__main__":
     print("=== Road Coverage Recorder Integration Tests ===")

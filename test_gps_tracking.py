@@ -1229,5 +1229,299 @@ class TestGPSRoadTracking(unittest.TestCase):
         self.assertGreater(points_per_second, 10, "Should process at least 10 points per second")
 
 
+class TestGPSRoadTrackingWithActualData(unittest.TestCase):
+    """Tests focused on GPS processing and road tracking using actual road data."""
+    
+    def setUp(self):
+        """Set up test environment before each test."""
+        # Create temporary directories for test data
+        self.temp_dir = tempfile.mkdtemp()
+        self.save_dir = os.path.join(self.temp_dir, "recordings")
+        os.makedirs(self.save_dir, exist_ok=True)
+        
+        self.patcher_save_dir = patch('aio_t14b_mk2.SAVE_DIR', self.save_dir)
+        self.patcher_csv_file = patch('aio_t14b_mk2.CSV_FILE', os.path.join(self.save_dir, "test_actual_gps_log.csv"))
+        self.patcher_database = patch('aio_t14b_mk2.DATABASE', os.path.join(self.temp_dir, "test_coverage.db"))
+
+        self.patcher_save_dir.start()
+        self.patcher_csv_file.start()
+        self.patcher_database.start()
+        
+        # Try to load actual road data
+        try:
+            # Load actual preprocessed road data
+            bounds_array = np.load("preprocessed_roads/road_bounds.npy")
+            
+            with open("preprocessed_roads/road_data.pkl", "rb") as f:
+                road_data = pickle.load(f)
+            
+            with open("preprocessed_roads/buffer_polygons.pkl", "rb") as f:
+                buffer_polygons = pickle.load(f)
+            
+            with open("preprocessed_roads/road_ids.pkl", "rb") as f:
+                road_ids = pickle.load(f)
+            
+            self.road_data = road_data
+            self.buffer_polygons = buffer_polygons
+            self.bounds_array = bounds_array
+            self.road_ids = road_ids
+            self.sample_roads = self.road_ids[:10] if len(self.road_ids) >= 10 else self.road_ids
+            
+            print(f"Loaded actual road network with {len(self.road_ids)} roads")
+            
+            # Load the data into the module
+            rcr.BOUNDS_ARRAY = bounds_array
+            rcr.ROAD_DATA = road_data
+            rcr.BUFFER_POLYGONS = buffer_polygons
+            rcr.ROAD_IDS = road_ids
+            rcr.PREPARED_POLYGONS = [shapely_prepared_mock.prep(poly) for poly in buffer_polygons]
+            
+        except Exception as e:
+            raise unittest.SkipTest(f"Could not load actual road data: {e}")
+        
+        # Reset global state variables
+        rcr.gps_queue = queue.Queue()
+        rcr.gps_data = {}
+        rcr.recorded_roads = set()
+        rcr.road_coverage_state = {}
+        rcr.current_road_id = None
+        rcr.recording_proc = None
+        rcr.recording_file = None
+        rcr.recording_start_time = None
+        rcr.last_recording_stop = 0
+        rcr.shutdown_event = threading.Event()
+        
+        # Mock CSV buffer
+        rcr.csv_buffer = []
+        rcr.csv_buffer_lock = threading.Lock()
+        rcr.last_csv_flush = time.time()
+        
+        # Mock counters
+        rcr.counter_lock = threading.Lock()
+        rcr.zone_check_counter = 0
+        rcr.gps_read_counter = 0
+        
+        # Initialize mock GPS
+        self.mock_gps = MockGPS()
+        self.setup_actual_gps_routes()
+        
+        # Mock recording functions to avoid actual subprocess calls
+        self.orig_start_recording = rcr.start_recording
+        self.orig_stop_recording = rcr.stop_recording
+        rcr.start_recording = MagicMock(return_value="/tmp/test_recording.mp4")
+        rcr.stop_recording = MagicMock()
+        rcr.save_recording_to_db = MagicMock()
+        
+        # Initialize CSV
+        with patch('aio_t14b_mk2.SAVE_DIR', self.save_dir):
+            rcr.init_csv()
+    
+    def tearDown(self):
+        """Clean up after each test."""
+        # Stop GPS simulation if running
+        self.mock_gps.stop()
+        
+        # Reset original functions
+        rcr.start_recording = self.orig_start_recording
+        rcr.stop_recording = self.orig_stop_recording
+        
+        # Stop all patches
+        self.patcher_save_dir.stop()
+        self.patcher_csv_file.stop()
+        self.patcher_database.stop()
+
+        # Clear temp directory
+        shutil.rmtree(self.temp_dir)
+        
+        # Reset shutdown event
+        rcr.shutdown_event.clear()
+    
+    def setup_actual_gps_routes(self):
+        """Set up GPS routes using actual road data."""
+        # Get some sample roads for testing
+        test_roads = self.sample_roads[:5]  # Use up to 5 roads
+        
+        route_count = 0
+        for i, road_id in enumerate(test_roads):
+            if road_id not in self.road_data:
+                continue
+                
+            segments = self.road_data[road_id]['segments']
+            if not segments or len(segments) < 2:
+                continue
+            
+            # Create GPS points from the road segments
+            route = []
+            
+            # Add points from the road segments
+            for seg in segments:
+                route.append((seg[1], seg[0], 1))  # (lat, lon, fix_quality)
+            
+            # Add the route
+            self.mock_gps.add_route(f"actual_road_{i+1}", route)
+            route_count += 1
+            
+            if route_count >= 3:  # Limit to 3 routes for testing
+                break
+        
+        # Create a combined route that traverses multiple roads
+        if route_count >= 2:
+            combined_route = []
+            for route_name in list(self.mock_gps.routes.keys())[:2]:
+                route = self.mock_gps.routes[route_name]
+                combined_route.extend(route)
+            
+            if combined_route:
+                self.mock_gps.add_route("actual_network_tour", combined_route)
+        
+        print(f"Created {len(self.mock_gps.routes)} GPS routes from actual road data")
+    
+    def test_actual_road_tracking(self):
+        """Test tracking while driving along actual roads."""
+        if not self.mock_gps.routes:
+            self.skipTest("No GPS routes available for testing")
+        
+        # Use the first available route
+        route_name = list(self.mock_gps.routes.keys())[0]
+        self.mock_gps.set_route(route_name)
+        
+        print(f"Testing road tracking with actual route '{route_name}'")
+        
+        # Start GPS simulation
+        self.mock_gps.start(rcr.gps_queue, delay=0.05)
+        
+        # Run tracking logic (using the same function from parent class)
+        end_time = time.time() + 2.0
+        while time.time() < end_time and not rcr.shutdown_event.is_set():
+            try:
+                gps = rcr.gps_queue.get(timeout=0.1)
+            except queue.Empty:
+                continue
+            
+            # Update global GPS data
+            rcr.gps_data = gps
+            
+            # Check if on a road
+            rid, info = rcr.find_current_road(gps['lon'], gps['lat'])
+            
+            if rid:
+                # Update coverage
+                seg_idx, seg_dist = rcr.find_nearest_segment(rid, gps['lat'], gps['lon'])
+                if seg_dist <= rcr.SEGMENT_THRESHOLD_M:
+                    rcr.road_coverage_state.setdefault(rid, set()).add(seg_idx)
+                
+                # Handle road entry
+                if rid != rcr.current_road_id:
+                    if rcr.recording_proc:
+                        rcr.stop_recording()
+                    
+                    # Start recording if not already recorded
+                    if rid not in rcr.recorded_roads:
+                        rcr.start_recording(rid)
+                    
+                    rcr.current_road_id = rid
+        
+        # Verify road coverage state contains expected roads
+        road_ids = set(rcr.road_coverage_state.keys())
+        self.assertGreater(len(road_ids), 0, "Should detect at least one actual road")
+        
+        print(f"Detected actual roads: {road_ids}")
+        
+        # Verify coverage
+        for detected_road in road_ids:
+            # Verify the detected road is in our actual road data
+            self.assertIn(detected_road, self.road_data, f"Detected road {detected_road} should be in actual road data")
+            
+            coverage = rcr.calculate_coverage(detected_road)
+            self.assertGreater(coverage, 0, f"Should have some coverage of actual road {detected_road}")
+            print(f"Coverage for actual road {detected_road}: {coverage:.1f}%")
+        
+        # Verify recording was started for at least one road
+        self.assertGreater(rcr.start_recording.call_count, 0, "Should start recording for at least one actual road")
+    
+    def test_actual_road_segments_precision(self):
+        """Test precision of segment detection with actual road geometries."""
+        if not self.sample_roads:
+            self.skipTest("No actual roads available for testing")
+        
+        # Find a road with multiple segments
+        test_road = None
+        for road_id in self.sample_roads:
+            if len(self.road_data[road_id]['segments']) >= 5:
+                test_road = road_id
+                break
+        
+        if not test_road:
+            self.skipTest("No road with sufficient segments found")
+        
+        road_info = self.road_data[test_road]
+        segments = road_info['segments']
+        
+        print(f"Testing segment precision with actual road {test_road} ({len(segments)} segments)")
+        
+        # Test points exactly on segments
+        for i, (lon, lat) in enumerate(segments):
+            gps_data = {
+                'lat': lat,
+                'lon': lon,
+                'fix': True,
+                'gps_qual': 1,
+                'time': time.time() + i
+            }
+            
+            # Find road and segment
+            rid, info = rcr.find_current_road(lon, lat)
+            
+            if rid == test_road:
+                seg_idx, seg_dist = rcr.find_nearest_segment(rid, lat, lon)
+                
+                # Should find the correct segment index or very close
+                self.assertLessEqual(seg_dist, 10, f"Distance to segment should be very small for point on road, got {seg_dist}m")
+                
+                # Add to coverage
+                rcr.road_coverage_state.setdefault(rid, set()).add(seg_idx)
+        
+        # Verify we detected the correct road and reasonable coverage
+        if test_road in rcr.road_coverage_state:
+            covered_segments = len(rcr.road_coverage_state[test_road])
+            total_segments = len(segments)
+            coverage = rcr.calculate_coverage(test_road)
+            
+            print(f"Precision test: {covered_segments}/{total_segments} segments = {coverage:.1f}%")
+            
+            # Should have detected a reasonable number of segments
+            self.assertGreater(covered_segments, 0, "Should detect some segments")
+            self.assertGreater(coverage, 0, "Should have positive coverage")
+    
+    def test_actual_road_bounds_optimization(self):
+        """Test that the bounds array optimization works with actual data."""
+        if not self.road_ids:
+            self.skipTest("No actual roads available for testing")
+        
+        # Test a point that should be in bounds of at least one road
+        test_road = self.road_ids[0]
+        road_info = self.road_data[test_road]
+        
+        if not road_info['segments']:
+            self.skipTest(f"Test road {test_road} has no segments")
+        
+        # Use a point from the road
+        lon, lat = road_info['segments'][0]
+        
+        # Test the bounds checking directly
+        start_time = time.time()
+        rid, info = rcr.find_current_road(lon, lat)
+        elapsed = time.time() - start_time
+        
+        print(f"Road lookup took {elapsed*1000:.2f}ms for actual data with {len(self.road_ids)} roads")
+        
+        # Should be reasonably fast even with 896 roads
+        self.assertLess(elapsed, 0.1, "Road lookup should be fast with bounds optimization")
+        
+        if rid:
+            self.assertIn(rid, self.road_data, f"Found road {rid} should be in actual road data")
+            print(f"Successfully found actual road: {rid}")
+
+
 if __name__ == "__main__":
     unittest.main()

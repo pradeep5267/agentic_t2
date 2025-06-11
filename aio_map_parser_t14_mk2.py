@@ -248,7 +248,7 @@ if __name__ == "__main__":
     
     # Input files should be in the preprocessed directory
     osm_file = f"{PREPROCESSED_DIR}/combined_area.osm"
-    kml_file = f"{PREPROCESSED_DIR}/areas.kml"
+    kml_file = f"{PREPROCESSED_DIR}/areas_a1.kml"
     
     # Output to the main recording directory
     output_geojson = f"{PREPROCESSED_DIR}/roads_with_polygons.geojson"

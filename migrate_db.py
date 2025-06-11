@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# migrate_db.py
 import sqlite3
 import os
 
