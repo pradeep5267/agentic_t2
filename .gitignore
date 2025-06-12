@@ -57,10 +57,10 @@ venv.bak/
 *.sqlite3
 
 # Large geospatial data files
-*.geojson
+# *.geojson
 # !static/*.geojson
-*.kml
-*.poly
+# *.kml
+# *.poly
 
 # IDE
 .vscode/
